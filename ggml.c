@@ -1609,6 +1609,69 @@ static inline __m512 dot_q4_0_oneblock_avx512(
 }
 #endif
 
+#if defined(__AVX2__) && QK == 32
+static inline __m256 dot_q4_0_oneblock_avx2(
+    __m256 acc,
+    const block_q4_0 * restrict x,
+    const block_q4_0 * restrict y,
+    int i
+) {
+    __m256i x16_0, x16_1;
+    __m256i y16_0, y16_1;
+
+    // Compute combined scale for the block
+    __m256 scale = _mm256_set1_ps( x[i].d * y[i].d );
+
+    __m128i x_nibbles = _mm_loadu_si128( ( const __m128i* )x[i].qs );
+
+    // Now we have a vector with nibbles in [ 0 .. 15 ] interval.
+    // Offset them into [ -8 .. +7 ] interval by flipping the sign bit with XOR.
+    // The sign bit needs to be preserved below.
+    const __m128i invert_mask = _mm_set1_epi8(0x88);
+    x_nibbles = _mm_xor_si128(x_nibbles, invert_mask);
+
+    // Expand bytes into uint16_t values, with sign extension
+    __m256i x16_nibbles = _mm256_cvtepi8_epi16( x_nibbles );
+
+    // Shift the uppper nibbles right. The sign component is already correct.
+    x16_1 = _mm256_srai_epi16(x16_nibbles, 4);
+
+    // Shift lower nibbles to the far left
+    // Shift back down to the far right, bringing the sign bit
+    x16_0 = _mm256_slli_epi16(x16_nibbles, 12);
+    x16_0 = _mm256_srai_epi16(x16_0, 12);
+
+    // Same load, XOR, shifting for the second array
+    __m128i y_nibbles = _mm_loadu_si128( ( const __m128i* )y[i].qs );
+    y_nibbles = _mm_xor_si128(y_nibbles, invert_mask);
+
+    __m256i y16_nibbles = _mm256_cvtepi8_epi16( y_nibbles );
+    y16_1 = _mm256_srai_epi16(y16_nibbles, 4);
+
+    y16_0 = _mm256_slli_epi16(y16_nibbles, 12);
+    y16_0 = _mm256_srai_epi16(y16_0, 12);
+
+    // Compute products of int16_t integers, add pairwise
+    __m256i i32 = _mm256_madd_epi16( x16_0, y16_0 );
+    i32 = _mm256_add_epi32( i32, _mm256_madd_epi16( x16_1, y16_1 ) );
+
+    // Convert int32_t to float
+    __m256 p = _mm256_cvtepi32_ps( i32 );
+    // Apply the scale, and accumulate
+    return _mm256_fmadd_ps( scale, p, acc );
+}
+
+// Horizontal sum of all lanes of the accumulator
+static inline float reduce_add_ps_avx2(__m256 acc) {
+    __m128 res = _mm256_extractf128_ps( acc, 1 );
+    res = _mm_add_ps( res, _mm256_castps256_ps128( acc ) );
+    res = _mm_add_ps( res, _mm_movehl_ps( res, res ) );
+    res = _mm_add_ss( res, _mm_movehdup_ps( res ) );
+
+    return _mm_cvtss_f32( res );
+}
+#endif
+
 inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t * restrict x, ggml_fp16_t * restrict y) {
     ggml_float sumf = 0.0;
 
@@ -1781,47 +1844,17 @@ static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * rest
     sumf = _mm512_reduce_add_ps( acc0 ) + _mm512_reduce_add_ps( acc1 );
 #elif defined(__AVX2__)
     // Initialize accumulator with zeros
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
 
     // Main loop
-    for (int i = 0; i < nb; ++i) {
-        // Compute combined scale for the block
-        const __m256 d = _mm256_mul_ps( _mm256_broadcast_ss( &x[i].d ), _mm256_broadcast_ss( &y[i].d ) );
-
-        // Load 16 bytes, and unpack 4 bit fields into bytes, making 32 bytes
-        __m256i bx = bytesFromNibbles( x[i].qs );
-        __m256i by = bytesFromNibbles( y[i].qs );
-
-        // Now we have a vector with bytes in [ 0 .. 15 ] interval. Offset them into [ -8 .. +7 ] interval.
-        const __m256i off = _mm256_set1_epi8( 8 );
-        bx = _mm256_sub_epi8( bx, off );
-        by = _mm256_sub_epi8( by, off );
-
-        // Sign-extend first 16 signed bytes into int16_t
-        __m256i x16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( bx ) );
-        __m256i y16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( by ) );
-        // Compute products of int16_t integers, add pairwise
-        __m256i i32 = _mm256_madd_epi16( x16, y16 );
-
-        // Sign-extend last 16 signed bytes into int16_t vectors
-        x16 = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( bx, 1 ) );
-        y16 = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( by, 1 ) );
-        // Accumulate products of int16_t integers
-        i32 = _mm256_add_epi32( i32, _mm256_madd_epi16( x16, y16 ) );
-
-        // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps( i32 );
-        // Apply the scale, and accumulate
-        acc = _mm256_fmadd_ps( d, p, acc );
+    for (int i = 0; i < nb; i += 2) {
+        acc0 = dot_q4_0_oneblock_avx2( acc0, x, y, i+0 );
+        acc1 = dot_q4_0_oneblock_avx2( acc1, x, y, i+1 );
     }
 
-    // Return horizontal sum of the acc vector
-    __m128 res = _mm256_extractf128_ps( acc, 1 );
-    res = _mm_add_ps( res, _mm256_castps256_ps128( acc ) );
-    res = _mm_add_ps( res, _mm_movehl_ps( res, res ) );
-    res = _mm_add_ss( res, _mm_movehdup_ps( res ) );
-
-    sumf = _mm_cvtss_f32( res );
+    // Horizontal sum of all lanes of the accumulator
+    sumf = reduce_add_ps_avx2( acc0 ) + reduce_add_ps_avx2( acc1 );
 #elif defined(__wasm_simd128__)
     // wasm simd
     float sum0 = 0.0f;
